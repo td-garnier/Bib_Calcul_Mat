@@ -1,15 +1,18 @@
 import numpy as np
 from random import randint
-from numba import njit, jit, int32, float32, vectorize,prange
+from numba import njit, jit, int32, float32, vectorize,prange,cuda
 import time
 import pandas as pd
+import math
+import cupy as cp
+import matplotlib.pyplot as plt
 
 # Time Mesurement for Matrix
 class Time_Measurement:
     def __init__(self):
         pass
 
-    def matrix_operations_times(self,matrix,size,optimizer=None):
+    def _matrix_operations_times(self,matrix,size,optimizer=None):
         A = matrix(size=size,optimizer=optimizer)
         B = matrix(size=size,optimizer=optimizer)
         result={}
@@ -21,20 +24,63 @@ class Time_Measurement:
         result['mul']=time.time()-start
         return result
 
-    def compare_for_severals_matrix_sizes(self,matrix,square_size,optimizer=None):
+    def _compare_for_severals_matrix_sizes(self,matrix,square_size,optimizer=None):
         result={}
-        self.matrix_operations_times(matrix,size=(1,1),optimizer=optimizer)
+        self._matrix_operations_times(matrix,size=(1,1),optimizer=optimizer)
         for i in square_size:
-            result[i]=self.matrix_operations_times(matrix,size=(i,i),optimizer=optimizer)
-        return pd.DataFrame(result)
+            result[i]=self._matrix_operations_times(matrix,size=(i,i),optimizer=optimizer)
+        return result
+    
+    def get_times_for_severals_matrix_sizes(self,matrix,square_size,optimizer=None):
+        return pd.DataFrame(self._compare_for_severals_matrix_sizes(matrix,square_size,optimizer))
+    
+    def _compare_for_severals_matrix_sizes_and_optimizer(self,matrix,square_size,optimizer_list):
+        result={}
+        for optimizer in optimizer_list:
+            result[optimizer]=self._compare_for_severals_matrix_sizes(matrix,square_size,optimizer)
+        return result
+    
+
+    def plot_times_for_severals_matrix_sizes_and_optimizer(self,result_matrix):
+
+        sizes = list(result_matrix[list(result_matrix.keys())[0]].keys())
+        add_result={}
+        mul_result={}
+        # Résultats pour l'addition
+        for key in result_matrix:
+            add_result[key] = [result_matrix[key][size]['add'] for size in sizes]
+            mul_result[key] = [result_matrix[key][size]['mul'] for size in sizes]
+
+        fig,ax=plt.subplots(1,2,figsize=(12,4))
+
+        ax[0].plot(pd.DataFrame(add_result,index=sizes))
+        ax[0].set_xscale('log')
+        ax[0].set_yscale('log')
+        ax[0].set_xlabel('matrix size')
+        ax[0].set_ylabel('time')
+        ax[0].legend(add_result.keys())
+        ax[0].set_title('add')
+
+        ax[1].plot(pd.DataFrame(mul_result,index=sizes))
+
+        ax[1].set_xscale('log')
+        ax[1].set_yscale('log')
+        ax[1].set_xlabel('matrix size')
+        ax[1].set_ylabel('time')
+        ax[1].legend(mul_result.keys())
+        ax[1].set_title('mul')
+
+        plt.tight_layout()
+        plt.show()
 
 ## No Numpy
 class Matrix:
     def __init__(self,array=None,size=(3,3),optimizer=None):
+        self.optimizer=optimizer
         
-        self.array_generation(array,size,optimizer)
+        self.array_generation(array,size)
     
-        match optimizer:
+        match self.optimizer:
             case 'numpy-jit':
                 self.add=np_add_jit
                 self.mul=np_mul_jit
@@ -44,6 +90,12 @@ class Matrix:
             case 'njit-parallel':
                 self.add=add_njit
                 self.mul=mul_njit
+            case 'cuda' :
+                self.add=add_cuda
+                self.mul=mul_cuda
+            case 'cupy' :
+                self.add=add_cupy
+                self.mul=mul_cupy
             case _:
                 self.add=add
                 self.mul=mul
@@ -52,22 +104,41 @@ class Matrix:
         return '{}'.format(self.values)
 
     def __add__(self,B):
-        return self.add(self.values,B.values)
+        if self.check_same_optimizer(B):
+            return self.add(self.values,B.values)
     
     def __mul__(self,B):
-        return self.mul(self.values,B.values)
+        if self.check_same_optimizer(B):
+            return self.mul(self.values,B.values)
     
-    def array_generation(self,array=None,size=(3,3),optimizer=None):
-        if optimizer == None or optimizer =='njit-parallel':
+    def array_generation(self,array=None,size=(3,3)):
+        if self.optimizer == None or self.optimizer =='njit-parallel':
             if array==None:
                 self.values=[[0 for _ in range(size[0])] for _ in range(size[1])]
             else:
                 self.values=array
-        elif optimizer == 'numpy-jit' or optimizer == 'numpy-njit':
+        elif self.optimizer == 'numpy-jit' or self.optimizer == 'numpy-njit' or self.optimizer == 'cuda' :
             if array==None:
                 self.values=np.zeros(size,dtype=np.float32)
             else:
                 self.values=np.array(array,dtype=np.float32)
+        elif self.optimizer == 'cupy':
+            if array==None:
+                self.values=cp.zeros(size,dtype=np.float32)
+            else:
+                self.values=cp.array(array,dtype=np.float32)
+        else : 
+            if array==None:
+                self.values=[[0 for _ in range(size[0])] for _ in range(size[1])]
+            else:
+                self.values=array
+    
+    def check_same_optimizer(self,B):
+        if self.optimizer==B.optimizer:
+            return True
+        else:
+            print('Matrix must be generated with same optimizer')
+            return False
 
 @jit
 def np_add_jit(A,B):
@@ -151,6 +222,60 @@ def mul_inside_jit(result, mat1, mat2, nrows_mat1, ncols_mat2, ncols_mat1):
                 result[i][j] += mat1[i][k] * mat2[k][j]
     return result
 
+def cuda_init(mat1,mat2):
+    z_h = np.zeros(shape=(mat1.shape[0],mat2.shape[1]))   
+    x_d = cuda.to_device(mat1)
+    y_d = cuda.to_device(mat2)
+    z_d = cuda.to_device(z_h)    
+    threadsperblock = (16, 16)
+    blockspergrid_x = math.ceil(z_h.shape[0] / threadsperblock[0])
+    blockspergrid_y = math.ceil(z_h.shape[1] / threadsperblock[1])
+    blockspergrid = (blockspergrid_x, blockspergrid_y)
+    return threadsperblock,blockspergrid,x_d,y_d,z_d
+
+# Test addition
+def add_cuda(mat1,mat2):
+    threadsperblock,blockspergrid,x_d,y_d,z_d=cuda_init(mat1,mat2)
+    addition_cuda[blockspergrid, threadsperblock](x_d, y_d, z_d)    
+    z_h = z_d.copy_to_host()
+    return z_h
+
+# CUDA kernel for matrix addition
+@cuda.jit
+def addition_cuda(mat1, mat2,new_matrix):
+    x, y = cuda.grid(2)
+    if x < new_matrix.shape[0] and y < new_matrix.shape[1]:
+        new_matrix[x,y] = mat1[x, y] + mat2[x, y]
+
+def mul_cuda(mat1,mat2):
+    threadsperblock,blockspergrid,x_d,y_d,z_d=cuda_init(mat1,mat2)   
+    multiplication_cuda[blockspergrid, threadsperblock](x_d, y_d, z_d)    
+    z_h = z_d.copy_to_host()
+    return z_h
+
+# CUDA kernel for matrix multiplication
+@cuda.jit
+def multiplication_cuda(mat1,mat2, new_matrix):
+    x, y = cuda.grid(2)
+    if x < new_matrix.shape[0] and y < new_matrix.shape[1]:
+        tmp = 0
+        for k in range(mat1.shape[1]):
+            tmp += mat1[x, k] * mat2[k, y]
+        new_matrix[x,y] = tmp
+
+
+# Fonction pour l'addition
+def add_cupy(mat1,mat2):
+    result=cp.add(mat1, mat2)
+    cp.cuda.Stream.null.synchronize()
+    return result
+
+
+# Fonction pour la multiplication
+def mul_cupy(mat1, mat2):
+    result=cp.matmul(mat1, mat2)
+    cp.cuda.Stream.null.synchronize()
+    return result
 
 
 
